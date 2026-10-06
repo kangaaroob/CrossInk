@@ -1,3 +1,9 @@
+## [Unreleased]
+
+### Added
+
+- Built-in Lexend Deca and Bitter fonts now show more characters common in translated light novels: Greek letters such as σ, ζ, and ϡ; stacked "glitch text" accents; symbols such as ※, ─, ▲, ▼, ●, ☆, and ↩; and the Japanese kana, kanji, Korean Hangul, and fullwidth punctuation used in translator notes.
+
 ## [v1.6.0] - 2026-09-21
 
 ### Added

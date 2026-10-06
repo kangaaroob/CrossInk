@@ -111,6 +111,65 @@ PHM_FALLBACK_RANGES=(
   0x91CA,0x91CA
 )
 
+# Book-text glyphs seen in English light-novel translations that the base
+# families lack. Ranges below are both exported and restricted to the named
+# fallback face, so they never override a glyph the base family already has.
+
+# ChareInk7 (all styles): combining marks used by "glitch" dialogue, and ₰.
+BOOK_CHAREINK_FALLBACK_RANGES=(
+  0x0300,0x036F
+  0x20B0,0x20B0
+)
+
+# Inter (all styles): sans glyphs for Ƞ ɪ ζ σ ω ※ ↩ and geometric shapes
+# ▲ △ ▼ ○ ● ☆ used as censor marks and scene breaks. ■ keeps its
+# synthetic solid-square rendering (EpdFontData.h syntheticGlyph).
+BOOK_INTER_FALLBACK_RANGES=(
+  0x0220,0x0220
+  0x026A,0x026A
+  0x03B6,0x03B6
+  0x03C3,0x03C3
+  0x03C9,0x03C9
+  0x203B,0x203B
+  0x21A9,0x21A9
+  0x25B2,0x25B3
+  0x25BC,0x25BC
+  0x25CB,0x25CB
+  0x25CF,0x25CF
+  0x2606,0x2606
+)
+
+# Noto Sans (Regular only; other styles fall back to Regular): Ϡ ϡ and the
+# combining marks ChareInk7 lacks (U+0340, U+0343-U+0345).
+BOOK_NOTOSANS_FALLBACK_RANGES=(
+  0x0340,0x0345
+  0x03E0,0x03E1
+)
+NOTOSANS_FONT="../builtinFonts/source/NotoSans/NotoSans-Regular.ttf"
+
+# Noto Sans CJK SC (Regular only): ─ ▒, CJK punctuation, the kana, kanji and
+# Hangul used in translator notes, and fullwidth/halfwidth forms.
+BOOK_CJK_FALLBACK_RANGES=(
+  0x2500,0x2500 0x2592,0x2592
+  0x3000,0x3002 0x300A,0x300F 0x301C,0x301C
+  0x3042,0x3042 0x3044,0x3044 0x3048,0x3048 0x304A,0x304A 0x3059,0x3059
+  0x305F,0x305F 0x3061,0x3061 0x3067,0x3067 0x3069,0x306B 0x306D,0x306D
+  0x307E,0x307E 0x3081,0x3081 0x308B,0x308C 0x3093,0x3093
+  0x30A4,0x30A4 0x30A7,0x30A7 0x30B9,0x30B9 0x30C0,0x30C0 0x30C3,0x30C3
+  0x30CF,0x30CF 0x30D5,0x30D5 0x30EA,0x30EA 0x30ED,0x30ED 0x30F3,0x30F3
+  0x30FB,0x30FC
+  0x4ECA,0x4ECA 0x524D,0x524D 0x541B,0x541B 0x5973,0x5973 0x6301,0x6301
+  0x661F,0x661F 0x6634,0x6634 0x6708,0x6708 0x68D2,0x68D2 0x69CB,0x69CB
+  0x6B63,0x6B63 0x6C17,0x6C17 0x70B8,0x70B8 0x7ADC,0x7ADC 0x7DF4,0x7DF4
+  0x8056,0x8056 0x83DC,0x83DC 0x865A,0x865A 0x88C2,0x88C2 0x8A66,0x8A66
+  0x91D1,0x91D1 0x9248,0x9248 0x938C,0x938C 0x98FE,0x98FE 0x9B3C,0x9B3C
+  0x9F2C,0x9F2C 0x9F8D,0x9F8D
+  0xB04C,0xB04C 0xB824,0xB824
+  0xFF01,0xFF01 0xFF08,0xFF09 0xFF1F,0xFF1F 0xFF24,0xFF24 0xFF2B,0xFF2B
+  0xFF2E,0xFF2E 0xFF3D,0xFF3D 0xFF5E,0xFF5E 0xFF70,0xFF70 0xFF78,0xFF78
+  0xFF8F,0xFF8F
+)
+
 READING_FONT_SIZES=(10 12 14 16)
 READING_FONT_STYLES=("Regular" "Bold" "Italic" "BoldItalic")
 READING_FONT_RENDER_ARGS=(--2bit --compress --pnum --darken-aa --zopfli)
@@ -120,6 +179,12 @@ font_include_args() {
   shift
   for range in "$@"; do
     printf '%s\n' --font-include-intervals "${face_index}:${range}"
+  done
+}
+
+additional_interval_args() {
+  for range in "$@"; do
+    printf '%s\n' --additional-intervals "${range}"
   done
 }
 
@@ -142,15 +207,23 @@ generate_family() {
 
       if [[ "$use_chareink_common_fallback" == "yes" ]]; then
         font_stack+=("../builtinFonts/source/ChareInk7/ChareInk7-${style}.ttf")
-        include_args+=($(font_include_args $(( ${#font_stack[@]} - 1 )) "${CHAREINK_FALLBACK_RANGES[@]}"))
+        include_args+=($(font_include_args $(( ${#font_stack[@]} - 1 )) "${CHAREINK_FALLBACK_RANGES[@]}" "${BOOK_CHAREINK_FALLBACK_RANGES[@]}"))
+        interval_args+=($(additional_interval_args "${BOOK_CHAREINK_FALLBACK_RANGES[@]}"))
       fi
+      font_stack+=("../builtinFonts/source/Inter/Inter-${style}.ttf")
+      include_args+=($(font_include_args $(( ${#font_stack[@]} - 1 )) "${BOOK_INTER_FALLBACK_RANGES[@]}"))
+      interval_args+=($(additional_interval_args "${BOOK_INTER_FALLBACK_RANGES[@]}"))
       font_stack+=("$SYMBOLS_FONT")
       include_args+=($(font_include_args $(( ${#font_stack[@]} - 1 )) "${SYMBOL_FALLBACK_RANGES[@]}"))
 
       if [[ "$style" == "Regular" ]]; then
+        font_stack+=("$NOTOSANS_FONT")
+        include_args+=($(font_include_args $(( ${#font_stack[@]} - 1 )) "${BOOK_NOTOSANS_FALLBACK_RANGES[@]}"))
+        interval_args+=($(additional_interval_args "${BOOK_NOTOSANS_FALLBACK_RANGES[@]}"))
         interval_args+=("${PHM_INTERVALS[@]}")
+        interval_args+=($(additional_interval_args "${BOOK_CJK_FALLBACK_RANGES[@]}"))
         font_stack+=("$PHM_FONT")
-        include_args+=($(font_include_args $(( ${#font_stack[@]} - 1 )) "${PHM_FALLBACK_RANGES[@]}"))
+        include_args+=($(font_include_args $(( ${#font_stack[@]} - 1 )) "${PHM_FALLBACK_RANGES[@]}" "${BOOK_CJK_FALLBACK_RANGES[@]}"))
       fi
 
       python fontconvert.py $font_name $size "${font_stack[@]}" "${interval_args[@]}" "${include_args[@]}" "${READING_FONT_RENDER_ARGS[@]}" > $output_path
