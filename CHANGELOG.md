@@ -4,6 +4,10 @@
 
 - Built-in Lexend Deca and Bitter fonts now show more characters common in translated light novels: Greek letters such as σ, ζ, and ϡ; stacked "glitch text" accents; symbols such as ※, ─, ▲, ▼, ●, ☆, and ↩; and the Japanese kana, kanji, Korean Hangul, and fullwidth punctuation used in translator notes.
 
+### Changed
+
+- Custom grayscale sleep images are cached on the SD card after the first sleep, so later sleeps show the image about 2.8 seconds faster on X4. The "Going to sleep" popup no longer shows before the sleep screen.
+
 ## [v1.6.0] - 2026-09-21
 
 ### Added

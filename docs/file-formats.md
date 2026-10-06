@@ -270,6 +270,56 @@ book is renamed or moved outside CrossInk, the path hash changes, so the old
 clipping file may no longer be associated with the book until the file is moved
 back or the clipping store is migrated.
 
+## `/.crosspoint/sleep_planes/<fnv64(path)>.bin`
+
+### Version 2
+
+Sleep plane cache files store the three pre-rendered framebuffer planes (BW,
+grayscale LSB, grayscale MSB) for a custom grayscale BMP sleep screen, so
+repeat sleeps stream the planes straight into the framebuffer instead of
+decoding and rasterizing the BMP three times (~2.8s saved per sleep on X4).
+Written by `SleepActivity` on a cache miss; only used when the image has
+grayscale data and the sleep cover filter is `No Filter`. Book-cover sleep
+screens are not cached here.
+
+The numeric filename is `ZipFile::fnvHash64()` of the image's SD-card path, so
+each image in a rotating sleep folder gets its own entry (~144KB each on X4).
+At most 20 entries are created; existing entries are still refreshed in place
+when stale. Deleting `/.crosspoint/sleep_planes/` safely resets the cache.
+
+The header doubles as the cache-busting key: any field mismatch (or a file size
+that differs from `header + 3 * planeSize`, e.g. after an interrupted write)
+discards the entry and re-renders. The version must be bumped whenever the
+render pipeline changes output for identical inputs — including the compile-time
+tone constants in `lib/GfxRenderer/BitmapHelpers.cpp` — or when the layout
+below changes.
+
+Binary layout (all LE, header is packed, 27 bytes):
+
+- `[0]` version (`2`)
+- `[1]` orientation (`GfxRenderer::Orientation` at render time)
+- `[2-3]` panel width (`uint16_t`)
+- `[4-5]` panel height (`uint16_t`)
+- `[6-7]` image path length (`uint16_t`, collision reduction for the hash)
+- `[8-15]` image path FNV-1a hash (`uint64_t`)
+- `[16-19]` image file size (`uint32_t`)
+- `[20-23]` image modify timestamp (`uint32_t`, FAT `date << 16 | time`; `0`
+  when unavailable, e.g. in the simulator)
+- `[24]` sleep cover mode (`FIT`/`CROP`; changes plane placement/cropping)
+- `[25]` sleep cover filter (always `No Filter` today; kept in the key because
+  the filter gates the grayscale path)
+- `[26]` grayscale base (`0` overlay, `1` absolute, `2` direct; selects the
+  plane encoding and the base refresh replayed on a hit)
+- three planes of `panelWidth / 8 * panelHeight` bytes each (48,000 on X4), in
+  read order: BW, grayscale LSB, grayscale MSB
+
+The planes are raw framebuffer snapshots taken after each render pass, so a
+cache hit replays the exact display sequence: BW plane → grayscale base
+refresh → LSB plane copy → MSB plane copy → gray LUT refresh.
+
+Version 1 (26-byte header without the grayscale base byte) was written by
+pre-1.6.0 custom builds; version 2 readers discard those files and re-render.
+
 ## `stats_v5.bin`
 
 ### Version 5

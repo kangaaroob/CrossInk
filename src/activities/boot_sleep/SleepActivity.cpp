@@ -12,10 +12,12 @@
 #include <I18n.h>
 #include <PNGdec.h>
 #include <Xtc.h>
+#include <ZipFile.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <new>
 #include <string_view>
@@ -41,6 +43,15 @@
 #include "images/Logo120.h"
 #include "images/MoonIcon.h"
 
+// Cache-key inputs for the pre-rendered sleep plane cache. Collected by the
+// caller because it owns the open image file handle: on hardware SdFat allows
+// only one open reader per path, so the key must not reopen the image to stat it.
+struct SleepPlaneCacheKey {
+  std::string path;
+  uint32_t imageSize = 0;
+  uint32_t imageMtime = 0;  // (FAT date << 16) | time; 0 when unavailable
+};
+
 namespace {
 
 constexpr bool TURN_OFF_SCREEN_AFTER_SLEEP_REFRESH = true;
@@ -51,6 +62,255 @@ constexpr int sleepLogoOffsetY = 8;
 bool sleepCoverFilterInvertsGeneratedScreen() {
   return SETTINGS.sleepScreenCoverFilter == CrossPointSettings::SLEEP_SCREEN_COVER_FILTER::INVERTED_BLACK_AND_WHITE;
 }
+
+// Which grayscale base refresh the panel uses for a sleep bitmap. The planes a
+// render produces depend on it (absolute modes encode complete planes), and a
+// cache hit must replay the same base refresh, so it is part of the cache key.
+enum class SleepGrayscaleBase : uint8_t { Overlay = 0, Absolute = 1, Direct = 2 };
+
+SleepGrayscaleBase sleepGrayscaleBaseFor(const GfxRenderer& renderer) {
+  // Prefer the Direct waveform where the panel implements it: it folds the B/W
+  // base into the grayscale pass rather than pushing a separate base refresh
+  // first. Direct is only ever an upgrade on top of Absolute, never a substitute.
+  if (!renderer.supportsAbsoluteGrayscale()) {
+    return SleepGrayscaleBase::Overlay;
+  }
+  return renderer.supportsDirectGrayscale() ? SleepGrayscaleBase::Direct : SleepGrayscaleBase::Absolute;
+}
+
+// Displays the framebuffer (the BW plane) as the base frame for the grayscale
+// planes that follow.
+bool displaySleepGrayscaleBase(const GfxRenderer& renderer, const SleepGrayscaleBase base) {
+  switch (base) {
+    case SleepGrayscaleBase::Direct:
+      return renderer.displayDirectGrayscaleBase();
+    case SleepGrayscaleBase::Absolute:
+      return renderer.displayAbsoluteGrayscaleBase();
+    case SleepGrayscaleBase::Overlay:
+      renderer.displayGrayscaleBase(HalDisplay::HALF_REFRESH);
+      return true;
+  }
+  return false;
+}
+
+// ---- Pre-rendered sleep plane cache ----
+// Rendering a grayscale BMP sleep screen rasterizes the image three times (BW
+// plus two grayscale planes, ~2.8s on X4). The three framebuffer-sized planes
+// are cached on SD so repeat sleeps stream them straight into the framebuffer.
+// Layout is documented in docs/file-formats.md. Bump the version when the
+// render pipeline changes output for identical inputs (e.g. the tone constants
+// in BitmapHelpers.cpp) or when the layout below changes.
+constexpr uint8_t SLEEP_PLANE_CACHE_VERSION = 2;
+constexpr const char* SLEEP_PLANE_CACHE_DIR = "/.crosspoint/sleep_planes";
+// ~144KB per entry; new entries stop being cached at the cap so a large
+// rotating /sleep folder cannot grow the cache unbounded. Existing entries are
+// still refreshed in place when their key goes stale.
+constexpr int SLEEP_PLANE_CACHE_MAX_ENTRIES = 20;
+
+// The header doubles as the cache-busting key: any field mismatch discards the
+// entry and re-renders. Fields are compared with memcmp, so the struct must
+// stay free of padding.
+#pragma pack(push, 1)
+struct SleepPlaneCacheHeader {
+  uint8_t version;
+  uint8_t orientation;  // GfxRenderer::Orientation at render time
+  uint16_t panelWidth;
+  uint16_t panelHeight;
+  uint16_t imagePathLength;
+  uint64_t imagePathHash;  // ZipFile::fnvHash64 of the image path
+  uint32_t imageSize;
+  uint32_t imageMtime;
+  uint8_t coverMode;      // SETTINGS.sleepScreenCoverMode
+  uint8_t coverFilter;    // SETTINGS.sleepScreenCoverFilter
+  uint8_t grayscaleBase;  // SleepGrayscaleBase
+};
+#pragma pack(pop)
+
+std::string sleepPlaneCachePathFor(const std::string& imagePath) {
+  return std::string(SLEEP_PLANE_CACHE_DIR) + "/" +
+         std::to_string(ZipFile::fnvHash64(imagePath.c_str(), imagePath.size())) + ".bin";
+}
+
+SleepPlaneCacheHeader makeSleepPlaneCacheHeader(const SleepPlaneCacheKey& key, const GfxRenderer& renderer) {
+  SleepPlaneCacheHeader header = {};
+  header.version = SLEEP_PLANE_CACHE_VERSION;
+  header.orientation = static_cast<uint8_t>(renderer.getOrientation());
+  header.panelWidth = renderer.getDisplayWidth();
+  header.panelHeight = renderer.getDisplayHeight();
+  header.imagePathLength = static_cast<uint16_t>(std::min(key.path.size(), static_cast<size_t>(UINT16_MAX)));
+  header.imagePathHash = ZipFile::fnvHash64(key.path.c_str(), key.path.size());
+  header.imageSize = key.imageSize;
+  header.imageMtime = key.imageMtime;
+  header.coverMode = SETTINGS.sleepScreenCoverMode;
+  header.coverFilter = SETTINGS.sleepScreenCoverFilter;
+  header.grayscaleBase = static_cast<uint8_t>(sleepGrayscaleBaseFor(renderer));
+  return header;
+}
+
+SleepPlaneCacheKey makeSleepPlaneCacheKeyForOpenImage(const std::string& path, FsFile& file) {
+  SleepPlaneCacheKey key;
+  key.path = path;
+  key.imageSize = static_cast<uint32_t>(file.size());
+#ifndef SIMULATOR
+  // The simulator HalFile has no mtime accessor; its key degrades to size-only.
+  key.imageMtime = file.getModifyDateTime();
+#endif
+  return key;
+}
+
+// Stream the three cached planes straight into the shared framebuffer, running
+// the same display sequence as the render path: BW plane must be displayed
+// (base refresh) before the grayscale planes are copied, because the base
+// refresh consumes both controller RAM banks. Returns false on any mismatch or
+// read failure so the caller falls back to a full render.
+bool tryRenderCachedSleepPlanes(const GfxRenderer& renderer, const SleepPlaneCacheKey& key) {
+  const std::string cachePath = sleepPlaneCachePathFor(key.path);
+  if (!Storage.exists(cachePath.c_str())) {
+    return false;
+  }
+
+  FsFile file;
+  if (!Storage.openFileForRead("SLP", cachePath, file)) {
+    return false;
+  }
+
+  const size_t planeSize = renderer.getBufferSize();
+  const size_t expectedFileSize = sizeof(SleepPlaneCacheHeader) + 3 * planeSize;
+  SleepPlaneCacheHeader stored = {};
+  const SleepPlaneCacheHeader expected = makeSleepPlaneCacheHeader(key, renderer);
+  if (file.fileSize() != expectedFileSize || file.read(&stored, sizeof(stored)) != static_cast<int>(sizeof(stored)) ||
+      memcmp(&stored, &expected, sizeof(stored)) != 0) {
+    LOG_INF("SLP", "Sleep plane cache stale for %s, re-rendering", key.path.c_str());
+    file.close();
+    return false;
+  }
+
+  // Planes read directly into the framebuffer: no plane-sized heap allocation.
+  uint8_t* frameBuffer = renderer.getFrameBuffer();
+  if (file.read(frameBuffer, planeSize) != static_cast<int>(planeSize)) {
+    LOG_ERR("SLP", "Sleep plane cache BW read failed: %s", cachePath.c_str());
+    file.close();
+    return false;
+  }
+  if (!displaySleepGrayscaleBase(renderer, static_cast<SleepGrayscaleBase>(stored.grayscaleBase))) {
+    LOG_ERR("SLP", "Sleep plane cache grayscale base refresh failed");
+    file.close();
+    return false;
+  }
+
+  if (file.read(frameBuffer, planeSize) != static_cast<int>(planeSize)) {
+    LOG_ERR("SLP", "Sleep plane cache LSB read failed: %s", cachePath.c_str());
+    file.close();
+    return false;
+  }
+  renderer.copyGrayscaleLsbBuffers();
+
+  if (file.read(frameBuffer, planeSize) != static_cast<int>(planeSize)) {
+    LOG_ERR("SLP", "Sleep plane cache MSB read failed: %s", cachePath.c_str());
+    file.close();
+    return false;
+  }
+  renderer.copyGrayscaleMsbBuffers();
+  file.close();
+
+  renderer.displayGrayBuffer(TURN_OFF_SCREEN_AFTER_SLEEP_REFRESH);
+  return true;
+}
+
+bool sleepPlaneCacheHasRoomForNewEntry() {
+  FsFile dir = Storage.open(SLEEP_PLANE_CACHE_DIR);
+  if (!dir || !dir.isDirectory()) {
+    if (dir) {
+      dir.close();
+    }
+    return true;  // directory not created yet
+  }
+  int entries = 0;
+  for (auto file = dir.openNextFile(); file; file = dir.openNextFile()) {
+    if (!file.isDirectory()) {
+      entries++;
+    }
+    file.close();
+  }
+  dir.close();
+  return entries < SLEEP_PLANE_CACHE_MAX_ENTRIES;
+}
+
+// Persists the three rendered planes while the render path runs. Any failure
+// deactivates the writer and removes the partial file; rendering is never
+// affected. A truncated file left by a mid-write power loss is caught by the
+// exact-size check on read.
+class SleepPlaneCacheWriter {
+ public:
+  ~SleepPlaneCacheWriter() {
+    if (active) {
+      abandon();  // render path ended before all planes were written
+    }
+  }
+
+  void begin(const SleepPlaneCacheKey& key, const GfxRenderer& renderer) {
+    cachePath = sleepPlaneCachePathFor(key.path);
+    if (!Storage.exists(cachePath.c_str()) && !sleepPlaneCacheHasRoomForNewEntry()) {
+      LOG_INF("SLP", "Sleep plane cache full (%d entries), not caching %s", SLEEP_PLANE_CACHE_MAX_ENTRIES,
+              key.path.c_str());
+      return;
+    }
+    if (!Storage.ensureDirectoryExists(SLEEP_PLANE_CACHE_DIR)) {
+      LOG_ERR("SLP", "Failed to create sleep plane cache dir: %s", SLEEP_PLANE_CACHE_DIR);
+      return;
+    }
+    if (!Storage.openFileForWrite("SLP", cachePath, file)) {
+      LOG_ERR("SLP", "Failed to open sleep plane cache for write: %s", cachePath.c_str());
+      return;
+    }
+    const SleepPlaneCacheHeader header = makeSleepPlaneCacheHeader(key, renderer);
+    if (file.write(&header, sizeof(header)) != sizeof(header)) {
+      LOG_ERR("SLP", "Sleep plane cache header write failed: %s", cachePath.c_str());
+      abandon();
+      return;
+    }
+    active = true;
+  }
+
+  // Appends the framebuffer (the plane just composed by the render pass).
+  void writePlane(const GfxRenderer& renderer) {
+    if (!active) {
+      return;
+    }
+    const size_t planeSize = renderer.getBufferSize();
+    if (file.write(renderer.getFrameBuffer(), planeSize) != planeSize) {
+      LOG_ERR("SLP", "Sleep plane cache write failed: %s", cachePath.c_str());
+      abandon();
+      return;
+    }
+    planesWritten++;
+  }
+
+  void finish() {
+    if (!active) {
+      return;
+    }
+    active = false;
+    file.close();
+    if (planesWritten == 3) {
+      LOG_INF("SLP", "Cached sleep planes: %s", cachePath.c_str());
+    } else {
+      Storage.remove(cachePath.c_str());
+    }
+  }
+
+ private:
+  void abandon() {
+    active = false;
+    file.close();
+    Storage.remove(cachePath.c_str());
+  }
+
+  FsFile file;
+  std::string cachePath;
+  int planesWritten = 0;
+  bool active = false;
+};
 
 void hideOverlayBatteryStrip(const GfxRenderer& renderer) {
   if (!SETTINGS.statusBarBattery) {
@@ -531,10 +791,11 @@ void SleepActivity::onEnter() {
   overlayBackgroundBufferStored =
       sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::OVERLAY && renderer.storeBwBuffer();
 
-  // X4 Pro and X4 Classic share a panel that can retain this high-contrast
-  // transient update beneath the final OEM-style sleep refresh. Render only
-  // the final sleep frame on that panel family.
-  const bool showSleepPopup = !BoardConfig::isX4Pro() && !CROSSINK_APP_DEVICE_X4CLASSIC;
+  // The "Going to sleep" popup costs a full panel refresh before the sleep
+  // screen itself, so it is disabled on every device: render only the final
+  // sleep frame. (Upstream already skipped it on X4 Pro / X4 Classic because
+  // that panel can retain the transient popup beneath the sleep refresh.)
+  constexpr bool showSleepPopup = false;
   // Show the popup in the orientation that was visible before reader exit restores
   // global settings. Reset to portrait afterwards so sleep screen layout stays unchanged.
   if (APP_STATE.lastSleepFromReader) {
@@ -584,7 +845,6 @@ void SleepActivity::renderCustomSleepScreen() const {
     }
 
     LOG_INF("SLP", "Loading custom sleep image: %s", selection.path.c_str());
-    delay(100);
     // Use image-specific gray levels only when the panel accepts complete planes.
     Bitmap bitmap(file, true,
                   renderer.supportsAbsoluteGrayscale() &&
@@ -597,7 +857,8 @@ void SleepActivity::renderCustomSleepScreen() const {
       return false;
     }
 
-    const bool success = renderBitmapSleepScreen(bitmap);
+    const SleepPlaneCacheKey cacheKey = makeSleepPlaneCacheKeyForOpenImage(selection.path, file);
+    const bool success = renderBitmapSleepScreen(bitmap, &cacheKey);
     file.close();
     return success;
   };
@@ -627,7 +888,8 @@ void SleepActivity::renderCustomSleepScreen() const {
                   renderer.supportsAbsoluteGrayscale() &&
                       SETTINGS.sleepScreenCoverFilter == CrossPointSettings::SLEEP_SCREEN_COVER_FILTER::NO_FILTER);
     if (bitmap.parseHeaders() == BmpReaderError::Ok) {
-      const bool success = renderBitmapSleepScreen(bitmap);
+      const SleepPlaneCacheKey cacheKey = makeSleepPlaneCacheKeyForOpenImage("/sleep.bmp", file);
+      const bool success = renderBitmapSleepScreen(bitmap, &cacheKey);
       file.close();
       if (success) return;
     }
@@ -666,7 +928,15 @@ void SleepActivity::renderDefaultSleepScreen() const {
   renderer.displayBuffer(HalDisplay::HALF_REFRESH, TURN_OFF_SCREEN_AFTER_SLEEP_REFRESH);
 }
 
-bool SleepActivity::renderBitmapSleepScreen(Bitmap& bitmap) const {
+bool SleepActivity::renderBitmapSleepScreen(Bitmap& bitmap, const SleepPlaneCacheKey* cacheKey) const {
+  const bool hasGreyscale = bitmap.hasGreyscale() &&
+                            SETTINGS.sleepScreenCoverFilter == CrossPointSettings::SLEEP_SCREEN_COVER_FILTER::NO_FILTER;
+
+  if (hasGreyscale && cacheKey != nullptr && tryRenderCachedSleepPlanes(renderer, *cacheKey)) {
+    LOG_INF("SLP", "Rendered sleep image from plane cache");
+    return true;
+  }
+
   int x, y;
   const auto pageWidth = renderer.getScreenWidth();
   const auto pageHeight = renderer.getScreenHeight();
@@ -711,10 +981,12 @@ bool SleepActivity::renderBitmapSleepScreen(Bitmap& bitmap) const {
     y = (pageHeight - bitmap.getHeight()) / 2;
   }
 
-  renderer.clearScreen();
+  SleepPlaneCacheWriter cacheWriter;
+  if (hasGreyscale && cacheKey != nullptr) {
+    cacheWriter.begin(*cacheKey, renderer);
+  }
 
-  const bool hasGreyscale = bitmap.hasGreyscale() &&
-                            SETTINGS.sleepScreenCoverFilter == CrossPointSettings::SLEEP_SCREEN_COVER_FILTER::NO_FILTER;
+  renderer.clearScreen();
 
   if (!renderer.drawBitmap(bitmap, x, y, pageWidth, pageHeight, cropX, cropY)) return false;
 
@@ -727,18 +999,12 @@ bool SleepActivity::renderBitmapSleepScreen(Bitmap& bitmap) const {
     return true;
   }
 
-  // Prefer the Direct waveform where the panel implements it: it folds the B/W
-  // base into the grayscale pass rather than pushing a separate base refresh
-  // first. Keep `absolute` on the Absolute probe alone so it matches what the
-  // callers pass to SleepCoverAssets and the Bitmap dither/level mode; Direct
-  // is only ever an upgrade on top of it, never a substitute.
-  const bool absolute = renderer.supportsAbsoluteGrayscale();
-  const bool direct = absolute && renderer.supportsDirectGrayscale();
-  if (absolute) {
-    if (!(direct ? renderer.displayDirectGrayscaleBase() : renderer.displayAbsoluteGrayscaleBase())) return false;
-  } else {
-    renderer.displayGrayscaleBase(HalDisplay::HALF_REFRESH);
-  }
+  cacheWriter.writePlane(renderer);  // BW plane
+  // Keep `absolute` on the Absolute probe alone so it matches what the callers
+  // pass to SleepCoverAssets and the Bitmap dither/level mode.
+  const SleepGrayscaleBase grayscaleBase = sleepGrayscaleBaseFor(renderer);
+  const bool absolute = grayscaleBase != SleepGrayscaleBase::Overlay;
+  if (!displaySleepGrayscaleBase(renderer, grayscaleBase)) return false;
 
   for (const auto mode : {GfxRenderer::GRAYSCALE_LSB, GfxRenderer::GRAYSCALE_MSB}) {
     if (bitmap.rewindToData() != BmpReaderError::Ok) {
@@ -753,11 +1019,13 @@ bool SleepActivity::renderBitmapSleepScreen(Bitmap& bitmap) const {
       renderer.setRenderMode(GfxRenderer::BW);
       return false;
     }
+    cacheWriter.writePlane(renderer);  // LSB, then MSB plane
     if (mode == GfxRenderer::GRAYSCALE_LSB)
       renderer.copyGrayscaleLsbBuffers();
     else
       renderer.copyGrayscaleMsbBuffers();
   }
+  cacheWriter.finish();
   renderer.displayGrayBuffer(TURN_OFF_SCREEN_AFTER_SLEEP_REFRESH);
   renderer.setRenderMode(GfxRenderer::BW);
   return true;

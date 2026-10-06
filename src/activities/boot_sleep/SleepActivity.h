@@ -5,6 +5,7 @@
 #include "activities/Activity.h"
 
 class Bitmap;
+struct SleepPlaneCacheKey;
 
 class SleepActivity final : public Activity {
  public:
@@ -26,7 +27,7 @@ class SleepActivity final : public Activity {
   void renderMinimalSleepScreen() const;
   void renderMinimalStatsSleepScreen() const;
   void renderDashboardSleepScreen() const;
-  bool renderBitmapSleepScreen(Bitmap& bitmap) const;
+  bool renderBitmapSleepScreen(Bitmap& bitmap, const SleepPlaneCacheKey* cacheKey = nullptr) const;
   void renderLastScreenSleepScreen() const;
   void renderBlankSleepScreen() const;
   void renderOverlaySleepScreen() const;
