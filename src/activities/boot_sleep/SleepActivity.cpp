@@ -45,6 +45,8 @@ namespace {
 
 constexpr bool TURN_OFF_SCREEN_AFTER_SLEEP_REFRESH = true;
 constexpr int sleepBuildInfoSideMargin = 20;
+// Nudge the logo down from dead centre so it sits closer to the wordmark below it.
+constexpr int sleepLogoOffsetY = 8;
 
 bool sleepCoverFilterInvertsGeneratedScreen() {
   return SETTINGS.sleepScreenCoverFilter == CrossPointSettings::SLEEP_SCREEN_COVER_FILTER::INVERTED_BLACK_AND_WHITE;
@@ -644,7 +646,7 @@ void SleepActivity::renderDefaultSleepScreen() const {
   const auto pageHeight = renderer.getScreenHeight();
 
   renderer.clearScreen();
-  renderer.drawImage(Logo120, (pageWidth - 120) / 2, (pageHeight - 120) / 2, 120, 120);
+  renderer.drawImage(Logo120, (pageWidth - 120) / 2, (pageHeight - 120) / 2 + sleepLogoOffsetY, 120, 120);
   renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 + 70, tr(STR_CROSSINK), true, EpdFontFamily::BOLD);
   renderer.drawCenteredText(SMALL_FONT_ID, pageHeight / 2 + 95, tr(STR_SLEEPING));
 
